@@ -26,3 +26,37 @@ ADD COLUMN vault_envelope_pin TEXT,
 ADD COLUMN vault_pin_salt TEXT,
 ADD COLUMN vault_envelope_passkey TEXT,
 ADD COLUMN passkey_id TEXT;
+
+### Step 2: Copy the Library into Your Project
+Copy the src/zk-vault/ and src/components/ directories from this repository directly into your React project's src/ folder.
+
+### Step 3: Create your Storage Adapter
+Create a file (e.g., src/lib/vaultAdapter.ts) to map the Vault's generic storage interface to your specific database.
+
+```ts
+import { supabase } from './supabaseClient'; 
+import { IVaultStorageAdapter } from '../zk-vault/types';
+
+export const supabaseVaultAdapter: IVaultStorageAdapter = {
+  loadEnvelopes: async (userId: string) => {
+    const { data } = await supabase.from('user_profiles').select('*').eq('id', userId).single();
+    if (!data) return { pinEnvelope: null, pinSalt: null, passkeyEnvelope: null, passkeyId: null };
+    
+    return {
+      pinEnvelope: data.vault_envelope_pin,
+      pinSalt: data.vault_pin_salt,
+      passkeyEnvelope: data.vault_envelope_passkey,
+      passkeyId: data.passkey_id
+    };
+  },
+  
+  saveEnvelopes: async (userId: string, envelopes) => {
+    const updates: any = {};
+    if (envelopes.pinEnvelope !== undefined) updates.vault_envelope_pin = envelopes.pinEnvelope;
+    if (envelopes.pinSalt !== undefined) updates.vault_pin_salt = envelopes.pinSalt;
+    if (envelopes.passkeyEnvelope !== undefined) updates.vault_envelope_passkey = envelopes.passkeyEnvelope;
+    if (envelopes.passkeyId !== undefined) updates.passkey_id = envelopes.passkeyId;
+
+    await supabase.from('user_profiles').update(updates).eq('id', userId);
+  }
+};
