@@ -26,6 +26,7 @@ ADD COLUMN vault_envelope_pin TEXT,
 ADD COLUMN vault_pin_salt TEXT,
 ADD COLUMN vault_envelope_passkey TEXT,
 ADD COLUMN passkey_id TEXT;
+```
 
 ### Step 2: Copy the Library into Your Project
 Copy the src/zk-vault/ and src/components/ directories from this repository directly into your React project's src/ folder.
