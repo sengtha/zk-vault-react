@@ -99,6 +99,8 @@ export async function unwrapKey(wrappedPayload: EncryptedPayload, wrappingKey: C
 }
 
 export async function registerPasskey(userId: string, email: string): Promise<{ id: string, key: CryptoKey }> {
+  // NOTE: Challenge is generated client-side. Server-side ceremony verification 
+  // is intentionally omitted in this zero-knowledge design.
   const challenge = window.crypto.getRandomValues(new Uint8Array(32));
   
   const credential = await navigator.credentials.create({
@@ -134,6 +136,8 @@ export async function registerPasskey(userId: string, email: string): Promise<{ 
 }
 
 export async function authenticatePasskey(passkeyIdHex: string): Promise<CryptoKey> {
+  // NOTE: Challenge is generated client-side. Server-side ceremony verification 
+  // is intentionally omitted in this zero-knowledge design.
   const challenge = window.crypto.getRandomValues(new Uint8Array(32));
   const rawId = hexToBuf(passkeyIdHex);
   
