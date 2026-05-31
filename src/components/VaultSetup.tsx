@@ -12,20 +12,18 @@ interface VaultSetupProps {
 
 export default function VaultSetup({ userId, userEmail, onSuccess }: VaultSetupProps) {
   const { setupVault } = useZkVault();
-  const [pin, setPin] = useState('');
+  const [passcode, setPasscode] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const handleSetup = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (pin.length < 6) return;
+    if (passcode.length < 8) return;
     
     setIsProcessing(true);
     setError(null);
     
-    // This generates the DEK, wraps it with the PIN, and automatically triggers
-    // the WebAuthn Passkey prompt to wrap it a second time.
-    const success = await setupVault(pin, userId, userEmail);
+    const success = await setupVault(passcode, userId, userEmail);
     
     if (success) {
       if (onSuccess) onSuccess();
@@ -44,7 +42,7 @@ export default function VaultSetup({ userId, userEmail, onSuccess }: VaultSetupP
         </div>
         <h2 className="text-2xl font-bold text-stone-900 mb-2">Initialize Your Vault</h2>
         <p className="text-sm text-stone-500 leading-relaxed">
-          Your vault is secured by two keys. First, create a recovery PIN. 
+          Your vault is secured by two keys. First, create a recovery passcode. 
           Then, link this device's biometrics.
         </p>
       </div>
@@ -53,8 +51,8 @@ export default function VaultSetup({ userId, userEmail, onSuccess }: VaultSetupP
         <div className="flex items-start gap-4 p-4 bg-stone-50 rounded-2xl border border-stone-100">
           <Key className="text-stone-400 shrink-0 mt-0.5" size={20} />
           <div>
-            <p className="text-sm font-bold text-stone-900">1. Recovery PIN</p>
-            <p className="text-xs text-stone-500 mt-1">Used to recover your data on new devices.</p>
+            <p className="text-sm font-bold text-stone-900">1. Recovery Passcode</p>
+            <p className="text-xs text-stone-500 mt-1">At least 8 characters. Used to recover your data on new devices.</p>
           </div>
         </div>
         
@@ -62,7 +60,7 @@ export default function VaultSetup({ userId, userEmail, onSuccess }: VaultSetupP
           <Fingerprint className="text-indigo-400 shrink-0 mt-0.5" size={20} />
           <div>
             <p className="text-sm font-bold text-stone-900">2. Hardware Passkey</p>
-            <p className="text-xs text-stone-500 mt-1">You will be prompted to use FaceID or TouchID after submitting your PIN.</p>
+            <p className="text-xs text-stone-500 mt-1">You will be prompted to use FaceID or TouchID after submitting your passcode.</p>
           </div>
         </div>
       </div>
@@ -70,18 +68,17 @@ export default function VaultSetup({ userId, userEmail, onSuccess }: VaultSetupP
       <form onSubmit={handleSetup} className="space-y-4">
         <input
           type="password"
-          maxLength={6}
-          value={pin}
-          onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))} // Restrict to numbers
-          placeholder="Create 6-digit PIN"
-          className="w-full bg-stone-50 border border-stone-200 focus:border-indigo-500 rounded-xl px-4 py-4 text-center text-xl tracking-[0.5em] focus:outline-none transition-all placeholder:tracking-normal placeholder:text-sm"
+          value={passcode}
+          onChange={(e) => setPasscode(e.target.value)}
+          placeholder="Create 8+ character passcode"
+          className="w-full bg-stone-50 border border-stone-200 focus:border-indigo-500 rounded-xl px-4 py-4 text-center text-lg focus:outline-none transition-all placeholder:text-sm"
         />
         
         {error && <p className="text-xs text-red-500 font-bold uppercase tracking-wider text-center">{error}</p>}
 
         <button
           type="submit"
-          disabled={isProcessing || pin.length < 6}
+          disabled={isProcessing || passcode.length < 8}
           className="w-full py-4 bg-stone-900 hover:bg-stone-800 text-white font-bold rounded-xl flex items-center justify-center gap-2 transition-all disabled:opacity-50"
         >
           {isProcessing ? <Loader2 size={20} className="animate-spin" /> : (
