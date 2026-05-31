@@ -58,10 +58,12 @@ function toKeyBytes(src: ArrayBuffer | ArrayBufferView): Uint8Array<ArrayBuffer>
 // PRF salt is bound to the application origin so the same physical passkey
 // derives a *different* wrapping key on a different site (application
 // isolation). The hostname does not change at runtime, so memoize once.
-let _prfSalt: Uint8Array | null = null;
-function getPrfSalt(): Uint8Array {
+// Typed as Uint8Array<ArrayBuffer> to match toKeyBytes and satisfy the strict
+// BufferSource overloads under TS 5.7+ typed-array generics.
+let _prfSalt: Uint8Array<ArrayBuffer> | null = null;
+function getPrfSalt(): Uint8Array<ArrayBuffer> {
   if (_prfSalt === null) {
-    _prfSalt = encoder.encode(`zk-vault-v1:${window.location.hostname}`);
+    _prfSalt = toKeyBytes(encoder.encode(`zk-vault-v1:${window.location.hostname}`));
   }
   return _prfSalt;
 }

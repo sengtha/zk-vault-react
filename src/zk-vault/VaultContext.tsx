@@ -117,10 +117,24 @@ export function VaultProvider({
         const data = await storageAdapter.loadEnvelopes(userId);
         const hasPin = !!data.pinEnvelope && !!data.pinSalt;
         const hasPasskey = !!data.passkeyEnvelope && !!data.passkeyId;
-        return { exists: hasPin || hasPasskey, hasPin, hasPasskey };
+        return {
+          status: 'ok',
+          exists: hasPin || hasPasskey,
+          hasPin,
+          hasPasskey,
+        };
       } catch (err) {
-        handleError(err);
-        return { exists: false, hasPin: false, hasPasskey: false };
+        // Report the failure distinctly so callers don't mistake a transient
+        // load error for an empty vault and route the user into setup.
+        const error = err instanceof Error ? err : new Error(String(err));
+        handleError(error);
+        return {
+          status: 'error',
+          exists: false,
+          hasPin: false,
+          hasPasskey: false,
+          error,
+        };
       }
     },
     [storageAdapter, handleError]

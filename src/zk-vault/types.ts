@@ -9,11 +9,20 @@ export interface VaultEnvelopes {
   passkeyId: string | null;       // Hex string of the WebAuthn rawId
 }
 
-/** Which unlock methods are currently provisioned for a user. */
+/**
+ * Which unlock methods are currently provisioned for a user.
+ *
+ * `status` distinguishes a successful read from a failed one. A failed load
+ * (network/DB error) must NOT be treated as "no vault" — doing so could route a
+ * user into the setup flow and overwrite an existing vault. Callers should
+ * check `status === 'ok'` before trusting `exists`/`hasPin`/`hasPasskey`.
+ */
 export interface VaultStatus {
-  exists: boolean;     // any vault material present
+  status: 'ok' | 'error';
+  exists: boolean;     // any vault material present (meaningful only when status === 'ok')
   hasPin: boolean;     // a PIN envelope is provisioned
   hasPasskey: boolean; // a passkey envelope is provisioned
+  error?: Error;       // populated when status === 'error'
 }
 
 export interface IVaultStorageAdapter {
