@@ -1,6 +1,6 @@
 // src/zk-vault/VaultContext.tsx
 
-import React, { createContext, useState, useCallback } from 'react';
+import React, { createContext, useState, useCallback, useEffect, useRef } from 'react';
 import { IVaultStorageAdapter } from './types';
 import { 
   generateDEK, deriveKeyFromPin, wrapKey, unwrapKey, 
@@ -25,19 +25,66 @@ export const VaultContext = createContext<VaultContextType | undefined>(undefine
 
 interface VaultProviderProps {
   storageAdapter: IVaultStorageAdapter;
+  lockOnWindowBlur?: boolean;
+  autoLockTimeoutMs?: number;
+  onError?: (err: Error) => void;
   children: React.ReactNode;
 }
 
-export function VaultProvider({ storageAdapter, children }: VaultProviderProps) {
-  // HIDDEN: The session key never leaves this file, protecting it from generic XSS reading the Context.
+export function VaultProvider({ 
+  storageAdapter, 
+  lockOnWindowBlur = true, 
+  autoLockTimeoutMs = 300000, // 5 minutes default
+  onError,
+  children 
+}: VaultProviderProps) {
   const [sessionKey, setSessionKey] = useState<CryptoKey | null>(null);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  const handleError = useCallback((err: unknown) => {
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (onError) onError(error);
+    else console.error('[zk-vault]', error);
+  }, [onError]);
+
+  const lock = useCallback(() => {
+    setSessionKey(null);
+  }, []);
+
+  // --- Auto-Locking Logic ---
+  useEffect(() => {
+    if (!sessionKey) return;
+
+    const resetTimer = () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      if (autoLockTimeoutMs > 0) {
+        timeoutRef.current = setTimeout(lock, autoLockTimeoutMs);
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (lockOnWindowBlur && document.visibilityState === 'hidden') lock();
+    };
+
+    const activityEvents = ['mousemove', 'keydown', 'scroll', 'touchstart'];
+    activityEvents.forEach(e => window.addEventListener(e, resetTimer));
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    resetTimer();
+
+    return () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      activityEvents.forEach(e => window.removeEventListener(e, resetTimer));
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [sessionKey, autoLockTimeoutMs, lockOnWindowBlur, lock]);
+
+  // --- Core Methods ---
   const setupVault = useCallback(async (pin: string, userId: string, email: string) => {
     try {
       const dek = await generateDEK();
-      
       const salt = crypto.getRandomValues(new Uint8Array(32)); 
-      const hexSalt = bufToHex(salt.buffer); // Safer than Base64
+      const hexSalt = bufToHex(salt.buffer); 
       const pinWrappingKey = await deriveKeyFromPin(pin, salt.buffer);
       const pinEnvelope = await wrapKey(dek, pinWrappingKey);
 
@@ -48,7 +95,7 @@ export function VaultProvider({ storageAdapter, children }: VaultProviderProps) 
         passkeyId = id;
         passkeyEnvelope = await wrapKey(dek, passkeyWrappingKey);
       } catch (err) {
-        console.warn('Passkey skipped or unsupported during setup', err);
+        handleError(new Error('Passkey skipped or unsupported during setup: ' + String(err)));
       }
 
       await storageAdapter.saveEnvelopes(userId, {
@@ -61,10 +108,10 @@ export function VaultProvider({ storageAdapter, children }: VaultProviderProps) 
       setSessionKey(dek);
       return true;
     } catch (err) {
-      console.error('Setup failed:', err);
+      handleError(err);
       return false;
     }
-  }, [storageAdapter]);
+  }, [storageAdapter, handleError]);
 
   const unlockWithPin = useCallback(async (pin: string, userId: string) => {
     try {
@@ -79,10 +126,10 @@ export function VaultProvider({ storageAdapter, children }: VaultProviderProps) 
       setSessionKey(dek);
       return true;
     } catch (err) {
-      console.error('PIN Unlock failed:', err);
+      handleError(err);
       return false;
     }
-  }, [storageAdapter]);
+  }, [storageAdapter, handleError]);
 
   const unlockWithPasskey = useCallback(async (userId: string) => {
     try {
@@ -96,48 +143,63 @@ export function VaultProvider({ storageAdapter, children }: VaultProviderProps) 
       setSessionKey(dek);
       return true;
     } catch (err) {
-      console.error('Passkey Unlock failed:', err);
+      handleError(err);
       return false;
     }
-  }, [storageAdapter]);
+  }, [storageAdapter, handleError]);
 
   const resetPin = useCallback(async (newPin: string, userId: string) => {
     try {
       if (!sessionKey) throw new Error("Vault must be unlocked.");
+
+      const currentEnvelopes = await storageAdapter.loadEnvelopes(userId);
 
       const salt = crypto.getRandomValues(new Uint8Array(32));
       const hexSalt = bufToHex(salt.buffer);
       const newPinWrappingKey = await deriveKeyFromPin(newPin, salt.buffer);
       const newPinEnvelope = await wrapKey(sessionKey, newPinWrappingKey);
 
-      await storageAdapter.saveEnvelopes(userId, {
-        pinEnvelope: JSON.stringify(newPinEnvelope),
-        pinSalt: hexSalt
-      });
-      return true;
+      try {
+        await storageAdapter.saveEnvelopes(userId, {
+          pinEnvelope: JSON.stringify(newPinEnvelope),
+          pinSalt: hexSalt
+        });
+        return true;
+      } catch (saveError) {
+        // Rollback attempt to prevent permanent corruption
+        await storageAdapter.saveEnvelopes(userId, currentEnvelopes).catch(() => {});
+        throw saveError;
+      }
     } catch (err) {
-      console.error('Failed to reset PIN:', err);
+      handleError(err);
       return false;
     }
-  }, [sessionKey, storageAdapter]);
+  }, [sessionKey, storageAdapter, handleError]);
 
   const resetPasskey = useCallback(async (userId: string, email: string) => {
     try {
       if (!sessionKey) throw new Error("Vault must be unlocked.");
 
+      const currentEnvelopes = await storageAdapter.loadEnvelopes(userId);
       const { id: passkeyId, key: newPasskeyWrappingKey } = await registerPasskey(userId, email);
       const newPasskeyEnvelope = await wrapKey(sessionKey, newPasskeyWrappingKey);
 
-      await storageAdapter.saveEnvelopes(userId, {
-        passkeyEnvelope: JSON.stringify(newPasskeyEnvelope),
-        passkeyId
-      });
-      return true;
+      try {
+        await storageAdapter.saveEnvelopes(userId, {
+          passkeyEnvelope: JSON.stringify(newPasskeyEnvelope),
+          passkeyId
+        });
+        return true;
+      } catch (saveError) {
+        // Rollback attempt
+        await storageAdapter.saveEnvelopes(userId, currentEnvelopes).catch(() => {});
+        throw saveError;
+      }
     } catch (err) {
-      console.error('Failed to reset Passkey:', err);
+      handleError(err);
       return false;
     }
-  }, [sessionKey, storageAdapter]);
+  }, [sessionKey, storageAdapter, handleError]);
 
   const encryptPayload = useCallback(async (data: any) => {
     if (!sessionKey) throw new Error("Vault is locked");
@@ -148,8 +210,6 @@ export function VaultProvider({ storageAdapter, children }: VaultProviderProps) 
     if (!sessionKey) throw new Error("Vault is locked");
     return await decryptData(payload, sessionKey);
   }, [sessionKey]);
-
-  const lock = useCallback(() => setSessionKey(null), []);
 
   return (
     <VaultContext.Provider value={{
