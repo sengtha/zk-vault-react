@@ -34,7 +34,7 @@ interface VaultProviderProps {
 export function VaultProvider({ 
   storageAdapter, 
   lockOnWindowBlur = true, 
-  autoLockTimeoutMs = 300000, // 5 minutes default
+  autoLockTimeoutMs = 300000, 
   onError,
   children 
 }: VaultProviderProps) {
@@ -55,26 +55,32 @@ export function VaultProvider({
   useEffect(() => {
     if (!sessionKey) return;
 
-    const resetTimer = () => {
-      if (timeoutRef.current) clearTimeout(timeoutRef.current);
-      if (autoLockTimeoutMs > 0) {
-        timeoutRef.current = setTimeout(lock, autoLockTimeoutMs);
-      }
-    };
-
     const handleVisibilityChange = () => {
       if (lockOnWindowBlur && document.visibilityState === 'hidden') lock();
     };
 
-    const activityEvents = ['mousemove', 'keydown', 'scroll', 'touchstart'];
-    activityEvents.forEach(e => window.addEventListener(e, resetTimer));
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
-    resetTimer();
+    const activityEvents = ['mousemove', 'keydown', 'scroll', 'touchstart'];
+    
+    // Only attach activity listeners if timeout is greater than 0
+    if (autoLockTimeoutMs > 0) {
+      const resetTimer = () => {
+        if (timeoutRef.current) clearTimeout(timeoutRef.current);
+        timeoutRef.current = setTimeout(lock, autoLockTimeoutMs);
+      };
+
+      activityEvents.forEach(e => window.addEventListener(e, resetTimer));
+      resetTimer();
+
+      return () => {
+        if (timeoutRef.current) clearTimeout(timeoutRef.current);
+        activityEvents.forEach(e => window.removeEventListener(e, resetTimer));
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      };
+    }
 
     return () => {
-      if (timeoutRef.current) clearTimeout(timeoutRef.current);
-      activityEvents.forEach(e => window.removeEventListener(e, resetTimer));
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [sessionKey, autoLockTimeoutMs, lockOnWindowBlur, lock]);
@@ -153,7 +159,6 @@ export function VaultProvider({
       if (!sessionKey) throw new Error("Vault must be unlocked.");
 
       const currentEnvelopes = await storageAdapter.loadEnvelopes(userId);
-
       const salt = crypto.getRandomValues(new Uint8Array(32));
       const hexSalt = bufToHex(salt.buffer);
       const newPinWrappingKey = await deriveKeyFromPin(newPin, salt.buffer);
@@ -166,8 +171,11 @@ export function VaultProvider({
         });
         return true;
       } catch (saveError) {
-        // Rollback attempt to prevent permanent corruption
-        await storageAdapter.saveEnvelopes(userId, currentEnvelopes).catch(() => {});
+        try {
+          await storageAdapter.saveEnvelopes(userId, currentEnvelopes);
+        } catch (rollbackError) {
+          handleError(new Error(`CRITICAL: Reset failed and rollback also failed. Vault envelope may be corrupt. Original: ${saveError}. Rollback: ${rollbackError}`));
+        }
         throw saveError;
       }
     } catch (err) {
@@ -191,8 +199,11 @@ export function VaultProvider({
         });
         return true;
       } catch (saveError) {
-        // Rollback attempt
-        await storageAdapter.saveEnvelopes(userId, currentEnvelopes).catch(() => {});
+        try {
+          await storageAdapter.saveEnvelopes(userId, currentEnvelopes);
+        } catch (rollbackError) {
+          handleError(new Error(`CRITICAL: Passkey reset failed and rollback also failed. Original: ${saveError}. Rollback: ${rollbackError}`));
+        }
         throw saveError;
       }
     } catch (err) {
