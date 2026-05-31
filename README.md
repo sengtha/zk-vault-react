@@ -61,11 +61,12 @@ export const supabaseVaultAdapter: IVaultStorageAdapter = {
     await supabase.from('user_profiles').update(updates).eq('id', userId);
   }
 };
-
 ```
+
 ### Step 4: Wrap Your App with the Provider
 At the root of your authenticated app, wrap your components with the VaultProvider and pass in the adapter you just created.
-```
+
+```ts
 // App.tsx
 import { VaultProvider } from './zk-vault';
 import { supabaseVaultAdapter } from './lib/vaultAdapter';
@@ -82,7 +83,8 @@ function App({ user }) {
 The easiest way to integrate the Vault is to create a "Gatekeeper" component that checks if the user has set up their vault, and if it is unlocked.
 ## The Gatekeeper Pattern
 Use the included VaultSetup and VaultUnlock components to protect your main application.
-```
+
+```ts
 // VaultGatekeeper.tsx
 import React, { useEffect, useState } from 'react';
 import { useZkVault } from './zk-vault';
@@ -120,9 +122,11 @@ export default function VaultGatekeeper({ user }) {
   return <MainApplication />;
 }
 ```
+
 ## Allowing Users to Reset Credentials
 Inside your application's Settings or Profile page, simply drop in the VaultSettings component. It will automatically handle resetting the PIN or re-registering a Passkey.
-```
+
+```ts
 // ProfilePage.tsx
 import VaultSettings from '../components/VaultSettings';
 
@@ -136,11 +140,12 @@ export default function ProfilePage({ user }) {
     </div>
   );
 }
+```
 
 ## 🔐 Encrypting and Decrypting Your Data
 Once isUnlocked is true, the Vault Context holds the sessionKey (the unwrapped Master DEK) in memory. You use this key to encrypt your actual application data before sending it to your database.
 
-```
+```ts
 import { encryptData, decryptData } from '../zk-vault/crypto';
 import { useZkVault } from '../zk-vault';
 
