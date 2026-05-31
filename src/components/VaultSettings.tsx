@@ -14,11 +14,10 @@ export default function VaultSettings({ userId, userEmail }: VaultSettingsProps)
   
   const [isResettingPasskey, setIsResettingPasskey] = useState(false);
   const [showPinForm, setShowPinForm] = useState(false);
-  const [newPin, setNewPin] = useState('');
+  const [newPasscode, setNewPasscode] = useState('');
   const [isSubmittingPin, setIsSubmittingPin] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null);
 
-  // Safety check: Don't show these settings if the vault is currently locked.
   if (!isUnlocked) {
     return (
       <div className="p-6 bg-amber-50 border border-amber-200 rounded-3xl flex items-start gap-4">
@@ -52,18 +51,18 @@ export default function VaultSettings({ userId, userEmail }: VaultSettingsProps)
 
   const handlePinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (newPin.length < 6) return;
+    if (newPasscode.length < 8) return;
     
     setIsSubmittingPin(true);
     setMessage(null);
     try {
-      const success = await resetPin(newPin, userId);
+      const success = await resetPin(newPasscode, userId);
       if (success) {
-        setMessage({ type: 'success', text: 'Recovery PIN updated successfully!' });
+        setMessage({ type: 'success', text: 'Recovery Passcode updated successfully!' });
         setShowPinForm(false);
-        setNewPin('');
+        setNewPasscode('');
       } else {
-        setMessage({ type: 'error', text: 'Failed to update PIN.' });
+        setMessage({ type: 'error', text: 'Failed to update Passcode.' });
       }
     } catch (err) {
       setMessage({ type: 'error', text: 'An unexpected error occurred.' });
@@ -87,7 +86,6 @@ export default function VaultSettings({ userId, userEmail }: VaultSettingsProps)
         </div>
       )}
 
-      {/* Reset Passkey Action */}
       <div className="p-6 bg-white border border-stone-200 rounded-3xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition-all hover:border-indigo-200">
         <div className="flex items-center gap-4">
           <div className="w-12 h-12 bg-indigo-50 rounded-2xl flex items-center justify-center text-indigo-600">
@@ -109,7 +107,6 @@ export default function VaultSettings({ userId, userEmail }: VaultSettingsProps)
         </button>
       </div>
 
-      {/* Reset PIN Action */}
       <div className="p-6 bg-white border border-stone-200 rounded-3xl transition-all hover:border-stone-300">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex items-center gap-4">
@@ -117,9 +114,9 @@ export default function VaultSettings({ userId, userEmail }: VaultSettingsProps)
               <Key size={24} />
             </div>
             <div>
-              <p className="text-sm font-bold text-stone-900">Change Recovery PIN</p>
+              <p className="text-sm font-bold text-stone-900">Change Recovery Passcode</p>
               <p className="text-xs text-stone-500 mt-0.5 max-w-[250px] leading-relaxed">
-                Update the 6-digit fallback PIN used to decrypt your vault if your passkey is lost.
+                Update the 8+ character passcode used to decrypt your vault if your passkey is lost.
               </p>
             </div>
           </div>
@@ -129,23 +126,21 @@ export default function VaultSettings({ userId, userEmail }: VaultSettingsProps)
               onClick={() => setShowPinForm(true)}
               className="shrink-0 px-6 py-3 bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-bold uppercase tracking-wider rounded-xl transition-all"
             >
-              Change PIN
+              Change Passcode
             </button>
           )}
         </div>
 
-        {/* Expandable PIN Form */}
         {showPinForm && (
           <div className="pt-6 mt-6 border-t border-stone-100 animate-in fade-in slide-in-from-top-4">
             <form onSubmit={handlePinSubmit} className="flex flex-col sm:flex-row gap-3">
               <div className="relative flex-1 max-w-xs">
                 <input 
                   type="password" 
-                  maxLength={6}
-                  value={newPin}
-                  onChange={(e) => setNewPin(e.target.value.replace(/\D/g, ''))}
-                  placeholder="Enter new 6-digit PIN"
-                  className="w-full bg-stone-50 border border-stone-200 focus:border-stone-400 rounded-xl px-4 py-3 text-center text-lg tracking-[0.5em] focus:outline-none transition-all placeholder:tracking-normal placeholder:text-sm"
+                  value={newPasscode}
+                  onChange={(e) => setNewPasscode(e.target.value)}
+                  placeholder="Enter 8+ char passcode"
+                  className="w-full bg-stone-50 border border-stone-200 focus:border-stone-400 rounded-xl px-4 py-3 text-center text-lg focus:outline-none transition-all placeholder:text-sm"
                 />
               </div>
               
@@ -154,7 +149,7 @@ export default function VaultSettings({ userId, userEmail }: VaultSettingsProps)
                   type="button"
                   onClick={() => {
                     setShowPinForm(false);
-                    setNewPin('');
+                    setNewPasscode('');
                   }}
                   className="px-4 py-3 bg-stone-100 hover:bg-stone-200 text-stone-500 rounded-xl transition-all flex items-center justify-center"
                 >
@@ -162,11 +157,11 @@ export default function VaultSettings({ userId, userEmail }: VaultSettingsProps)
                 </button>
                 <button 
                   type="submit"
-                  disabled={isSubmittingPin || newPin.length < 6}
+                  disabled={isSubmittingPin || newPasscode.length < 8}
                   className="px-6 py-3 bg-stone-900 hover:bg-stone-800 text-white font-bold rounded-xl flex items-center justify-center gap-2 transition-all disabled:opacity-50"
                 >
                   {isSubmittingPin ? <Loader2 size={18} className="animate-spin" /> : (
-                    <>Save PIN <ChevronRight size={18} /></>
+                    <>Save <ChevronRight size={18} /></>
                   )}
                 </button>
               </div>
