@@ -1,171 +1,29 @@
 # Zero-Knowledge React Vault (`zk-vault-react`)
 
-A headless, database-agnostic React provider for Dual-Envelope (PIN + WebAuthn) cryptography. 
+A headless, database-agnostic React provider for Dual-Envelope (Passcode + WebAuthn) cryptography. 
 
 This library allows you to easily add End-to-End Encryption (E2EE) to any React application. It handles the complex WebCrypto and WebAuthn (Passkey) math while letting you bring your own database (Supabase, Firebase, etc.) for cross-device synchronization.
 
 ## ✨ Features
-* **Dual-Envelope Cryptography**: Users can unlock their vault using either a hardware Passkey (FaceID/TouchID) OR a cross-device 6-digit PIN.
-* **Zero-Knowledge**: The server only ever sees ciphertext. Keys never leave the browser.
-* **Database Agnostic**: Bring your own backend by implementing a simple 2-function Storage Adapter.
-* **Ready-to-use UI**: Drop-in Tailwind components for Setup, Unlock, and Settings.
+* **Dual-Envelope Cryptography**: Users can unlock their vault using either a hardware Passkey (FaceID/TouchID) OR a cross-device 8+ character alphanumeric Passcode.
+* **WebAuthn PRF Extension**: Hardware passkeys are fully utilized to generate un-extractable symmetric keys bound to the authenticator device.
+* **Zero-Knowledge Architecture**: The server only ever sees ciphertext. The Master Key (DEK) is securely trapped inside React closure memory and never exposed to the DOM.
+* **Auto-Locking**: Configurable timeout and window blur detection to lock the vault when inactive.
+* **Client-Side Rate Limiting**: Exponential backoff integrated into the Unlock UI to deter local rapid-fire offline guessing.
 
 ---
 
-## 🚀 Getting Started: Step-by-Step Integration
+## ⚠️ Important Architectural Considerations
 
-### Step 1: Prepare Your Database
-You need a place to store the cryptographic envelopes. Because this library is zero-knowledge, these columns will only ever contain random alphanumeric strings (Base64) or JSON ciphertext.
+Before implementing, you must understand the following threat-model trade-offs inherent to this client-side E2EE approach:
 
-**Example Supabase (PostgreSQL) Schema:**
-Run this SQL in your Supabase SQL Editor to add the required columns to your user profiles table:
+1. **Host Stability:** The WebAuthn PRF salt is generated dynamically using `window.location.hostname`. The domain you use during Passkey registration must perfectly match the domain used during authentication.
+2. **`extractable: true` Requirement:** Due to native `window.crypto.subtle` API constraints, the Master Data Encryption Key (DEK) must be generated as extractable so that it can be wrapped and unwrapped by the Passcode/Passkey KEKs. While the React Provider traps this key inside a secure closure, robust XSS prevention is still required in your application to prevent bad actors from tampering with the helper functions.
+3. **Client-Side WebAuthn:** As a true zero-knowledge client, the WebAuthn challenge is generated and validated client-side. The library relies completely on the browser's origin binding for replay prevention rather than a traditional server-side ceremony. 
+4. **Zero Recovery:** The server only holds ciphertext. If a user forgets their Passcode and loses their Passkey device simultaneously, their data cannot be recovered.
 
-```sql
-ALTER TABLE user_profiles 
-ADD COLUMN vault_envelope_pin TEXT,
-ADD COLUMN vault_pin_salt TEXT,
-ADD COLUMN vault_envelope_passkey TEXT,
-ADD COLUMN passkey_id TEXT;
-```
+---
 
-### Step 2: Copy the Library into Your Project
-Copy the src/zk-vault/ and src/components/ directories from this repository directly into your React project's src/ folder.
+## 🚀 Getting Started
 
-### Step 3: Create your Storage Adapter
-Create a file (e.g., src/lib/vaultAdapter.ts) to map the Vault's generic storage interface to your specific database.
-
-```ts
-import { supabase } from './supabaseClient'; 
-import { IVaultStorageAdapter } from '../zk-vault/types';
-
-export const supabaseVaultAdapter: IVaultStorageAdapter = {
-  loadEnvelopes: async (userId: string) => {
-    const { data } = await supabase.from('user_profiles').select('*').eq('id', userId).single();
-    if (!data) return { pinEnvelope: null, pinSalt: null, passkeyEnvelope: null, passkeyId: null };
-    
-    return {
-      pinEnvelope: data.vault_envelope_pin,
-      pinSalt: data.vault_pin_salt,
-      passkeyEnvelope: data.vault_envelope_passkey,
-      passkeyId: data.passkey_id
-    };
-  },
-  
-  saveEnvelopes: async (userId: string, envelopes) => {
-    const updates: any = {};
-    if (envelopes.pinEnvelope !== undefined) updates.vault_envelope_pin = envelopes.pinEnvelope;
-    if (envelopes.pinSalt !== undefined) updates.vault_pin_salt = envelopes.pinSalt;
-    if (envelopes.passkeyEnvelope !== undefined) updates.vault_envelope_passkey = envelopes.passkeyEnvelope;
-    if (envelopes.passkeyId !== undefined) updates.passkey_id = envelopes.passkeyId;
-
-    await supabase.from('user_profiles').update(updates).eq('id', userId);
-  }
-};
-```
-
-### Step 4: Wrap Your App with the Provider
-At the root of your authenticated app, wrap your components with the VaultProvider and pass in the adapter you just created.
-
-```ts
-// App.tsx
-import { VaultProvider } from './zk-vault';
-import { supabaseVaultAdapter } from './lib/vaultAdapter';
-
-function App({ user }) {
-  return (
-    <VaultProvider storageAdapter={supabaseVaultAdapter}>
-      <VaultGatekeeper user={user} />
-    </VaultProvider>
-  );
-}
-```
-## 🎨 Using the Drop-in UI Components
-The easiest way to integrate the Vault is to create a "Gatekeeper" component that checks if the user has set up their vault, and if it is unlocked.
-## The Gatekeeper Pattern
-Use the included VaultSetup and VaultUnlock components to protect your main application.
-
-```ts
-// VaultGatekeeper.tsx
-import React, { useEffect, useState } from 'react';
-import { useZkVault } from './zk-vault';
-import VaultSetup from './components/VaultSetup';
-import VaultUnlock from './components/VaultUnlock';
-import MainApplication from './MainApplication';
-import { supabase } from './lib/supabaseClient';
-
-export default function VaultGatekeeper({ user }) {
-  const { isUnlocked } = useZkVault();
-  const [hasVault, setHasVault] = useState<boolean | null>(null);
-
-  // Check if the user has already set up a vault in the DB
-  useEffect(() => {
-    async function checkStatus() {
-      const { data } = await supabase.from('user_profiles').select('vault_envelope_pin').eq('id', user.id).single();
-      setHasVault(!!data?.vault_envelope_pin);
-    }
-    checkStatus();
-  }, [user]);
-
-  if (hasVault === null) return <div>Loading...</div>;
-
-  // 1. If no vault exists in DB, show the Setup UI
-  if (!hasVault) {
-    return <VaultSetup userId={user.id} userEmail={user.email} onSuccess={() => setHasVault(true)} />;
-  }
-
-  // 2. If vault exists but is locked in memory, show the Unlock UI
-  if (!isUnlocked) {
-    return <VaultUnlock userId={user.id} />;
-  }
-
-  // 3. Vault is unlocked! Render the main app.
-  return <MainApplication />;
-}
-```
-
-## Allowing Users to Reset Credentials
-Inside your application's Settings or Profile page, simply drop in the VaultSettings component. It will automatically handle resetting the PIN or re-registering a Passkey.
-
-```ts
-// ProfilePage.tsx
-import VaultSettings from '../components/VaultSettings';
-
-export default function ProfilePage({ user }) {
-  return (
-    <div className="p-8">
-      <h1>Account Settings</h1>
-      
-      {/* Renders the PIN and Passkey reset forms */}
-      <VaultSettings userId={user.id} userEmail={user.email} />
-    </div>
-  );
-}
-```
-
-## 🔐 Encrypting and Decrypting Your Data
-Once isUnlocked is true, the Vault Context holds the sessionKey (the unwrapped Master DEK) in memory. You use this key to encrypt your actual application data before sending it to your database.
-
-```ts
-import { encryptData, decryptData } from '../zk-vault/crypto';
-import { useZkVault } from '../zk-vault';
-
-function SecureNoteEditor() {
-  const { sessionKey } = useZkVault();
-
-  const saveSecretNote = async (text: string) => {
-    if (!sessionKey) return;
-    
-    // Encrypts the payload with AES-GCM
-    const encryptedPayload = await encryptData({ note: text }, sessionKey);
-    
-    // Send to your database:
-    // await supabase.from('notes').insert({ 
-    //   cipher: encryptedPayload.cipher, 
-    //   iv: encryptedPayload.iv 
-    // });
-  };
-}
-```
-## ⚠️ Security Notes
-HTTPS Required: The WebCrypto and WebAuthn APIs require a secure context. This library will only work on localhost or over https://.
-Zero Recovery: Because the Master Key is derived from user inputs (PIN/Passkey) and the server only holds ciphertext, if a user forgets their PIN and loses their Passkey device simultaneously, their data cannot be recovered by anyone, including the database administrator.
+*(Refer to the source files for complete integration patterns, including Database Schema Preparation, Storage Adapter configuration, and wrapping your application with the `VaultProvider`)*
