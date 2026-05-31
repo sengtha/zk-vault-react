@@ -34,7 +34,9 @@ export default function VaultSettings({ userId, userEmail }: VaultSettingsProps)
     if (!isUnlocked) return;
     let active = true;
     checkVaultStatus(userId).then((s) => {
-      if (active) setHasPasskey(s.hasPasskey);
+      // Only trust the result on a clean read; on error leave hasPasskey
+      // unknown (null) so we don't wrongly offer "Add" and risk a surprise.
+      if (active && s.status === 'ok') setHasPasskey(s.hasPasskey);
     });
     return () => {
       active = false;
