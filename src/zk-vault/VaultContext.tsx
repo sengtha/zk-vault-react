@@ -1,20 +1,23 @@
 // src/zk-vault/VaultContext.tsx
 
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useState, useCallback } from 'react';
 import { IVaultStorageAdapter } from './types';
 import { 
   generateDEK, deriveKeyFromPin, wrapKey, unwrapKey, 
-  authenticatePasskey, registerPasskey 
+  authenticatePasskey, registerPasskey, 
+  encryptData, decryptData, EncryptedPayload,
+  bufToHex, hexToBuf
 } from './crypto';
 
 interface VaultContextType {
   isUnlocked: boolean;
-  sessionKey: CryptoKey | null;
   setupVault: (pin: string, userId: string, email: string) => Promise<boolean>;
   unlockWithPin: (pin: string, userId: string) => Promise<boolean>;
   unlockWithPasskey: (userId: string) => Promise<boolean>;
   resetPin: (newPin: string, userId: string) => Promise<boolean>;
   resetPasskey: (userId: string, email: string) => Promise<boolean>;
+  encryptPayload: (data: any) => Promise<EncryptedPayload>;
+  decryptPayload: (payload: EncryptedPayload) => Promise<any>;
   lock: () => void;
 }
 
@@ -26,16 +29,17 @@ interface VaultProviderProps {
 }
 
 export function VaultProvider({ storageAdapter, children }: VaultProviderProps) {
+  // HIDDEN: The session key never leaves this file, protecting it from generic XSS reading the Context.
   const [sessionKey, setSessionKey] = useState<CryptoKey | null>(null);
 
-  const setupVault = async (pin: string, userId: string, email: string) => {
+  const setupVault = useCallback(async (pin: string, userId: string, email: string) => {
     try {
       const dek = await generateDEK();
       
       const salt = crypto.getRandomValues(new Uint8Array(32)); 
+      const hexSalt = bufToHex(salt.buffer); // Safer than Base64
       const pinWrappingKey = await deriveKeyFromPin(pin, salt.buffer);
       const pinEnvelope = await wrapKey(dek, pinWrappingKey);
-      const base64Salt = btoa(String.fromCharCode(...salt));
 
       let passkeyId = null;
       let passkeyEnvelope = null;
@@ -44,12 +48,12 @@ export function VaultProvider({ storageAdapter, children }: VaultProviderProps) 
         passkeyId = id;
         passkeyEnvelope = await wrapKey(dek, passkeyWrappingKey);
       } catch (err) {
-        console.warn('Passkey skipped during setup');
+        console.warn('Passkey skipped or unsupported during setup', err);
       }
 
       await storageAdapter.saveEnvelopes(userId, {
         pinEnvelope: JSON.stringify(pinEnvelope),
-        pinSalt: base64Salt,
+        pinSalt: hexSalt,
         passkeyEnvelope: passkeyEnvelope ? JSON.stringify(passkeyEnvelope) : null,
         passkeyId
       });
@@ -60,18 +64,15 @@ export function VaultProvider({ storageAdapter, children }: VaultProviderProps) 
       console.error('Setup failed:', err);
       return false;
     }
-  };
+  }, [storageAdapter]);
 
-  const unlockWithPin = async (pin: string, userId: string) => {
+  const unlockWithPin = useCallback(async (pin: string, userId: string) => {
     try {
       const data = await storageAdapter.loadEnvelopes(userId);
       if (!data.pinEnvelope || !data.pinSalt) return false;
 
-      const saltString = atob(data.pinSalt);
-      const salt = new Uint8Array(saltString.length);
-      for (let i = 0; i < saltString.length; i++) salt[i] = saltString.charCodeAt(i);
-
-      const kek = await deriveKeyFromPin(pin, salt);
+      const saltBuf = hexToBuf(data.pinSalt);
+      const kek = await deriveKeyFromPin(pin, saltBuf);
       const envelope = JSON.parse(data.pinEnvelope);
       const dek = await unwrapKey(envelope, kek);
       
@@ -81,14 +82,14 @@ export function VaultProvider({ storageAdapter, children }: VaultProviderProps) 
       console.error('PIN Unlock failed:', err);
       return false;
     }
-  };
+  }, [storageAdapter]);
 
-  const unlockWithPasskey = async (userId: string) => {
+  const unlockWithPasskey = useCallback(async (userId: string) => {
     try {
       const data = await storageAdapter.loadEnvelopes(userId);
-      if (!data.passkeyEnvelope) return false;
+      if (!data.passkeyEnvelope || !data.passkeyId) return false;
 
-      const passkeyWrappingKey = await authenticatePasskey(userId);
+      const passkeyWrappingKey = await authenticatePasskey(data.passkeyId);
       const envelope = JSON.parse(data.passkeyEnvelope);
       const dek = await unwrapKey(envelope, passkeyWrappingKey);
       
@@ -98,67 +99,68 @@ export function VaultProvider({ storageAdapter, children }: VaultProviderProps) 
       console.error('Passkey Unlock failed:', err);
       return false;
     }
-  };
+  }, [storageAdapter]);
 
-  const resetPin = async (newPin: string, userId: string) => {
+  const resetPin = useCallback(async (newPin: string, userId: string) => {
     try {
-      if (!sessionKey) throw new Error("Vault must be unlocked to reset PIN.");
+      if (!sessionKey) throw new Error("Vault must be unlocked.");
 
-      // 1. Generate new salt and derive new KEK
       const salt = crypto.getRandomValues(new Uint8Array(32));
-      const base64Salt = btoa(String.fromCharCode(...salt));
+      const hexSalt = bufToHex(salt.buffer);
       const newPinWrappingKey = await deriveKeyFromPin(newPin, salt.buffer);
-      
-      // 2. Wrap the active session key (DEK) with the new PIN KEK
       const newPinEnvelope = await wrapKey(sessionKey, newPinWrappingKey);
 
-      // 3. Save via adapter (only overwriting PIN fields)
       await storageAdapter.saveEnvelopes(userId, {
         pinEnvelope: JSON.stringify(newPinEnvelope),
-        pinSalt: base64Salt
+        pinSalt: hexSalt
       });
-
       return true;
     } catch (err) {
       console.error('Failed to reset PIN:', err);
       return false;
     }
-  };
+  }, [sessionKey, storageAdapter]);
 
-  const resetPasskey = async (userId: string, email: string) => {
+  const resetPasskey = useCallback(async (userId: string, email: string) => {
     try {
-      if (!sessionKey) throw new Error("Vault must be unlocked to reset Passkey.");
+      if (!sessionKey) throw new Error("Vault must be unlocked.");
 
-      // 1. Register new Passkey
       const { id: passkeyId, key: newPasskeyWrappingKey } = await registerPasskey(userId, email);
-      
-      // 2. Wrap the active session key (DEK) with the new Passkey KEK
       const newPasskeyEnvelope = await wrapKey(sessionKey, newPasskeyWrappingKey);
 
-      // 3. Save via adapter (only overwriting Passkey fields)
       await storageAdapter.saveEnvelopes(userId, {
         passkeyEnvelope: JSON.stringify(newPasskeyEnvelope),
         passkeyId
       });
-
       return true;
     } catch (err) {
       console.error('Failed to reset Passkey:', err);
       return false;
     }
-  };
+  }, [sessionKey, storageAdapter]);
+
+  const encryptPayload = useCallback(async (data: any) => {
+    if (!sessionKey) throw new Error("Vault is locked");
+    return await encryptData(data, sessionKey);
+  }, [sessionKey]);
+
+  const decryptPayload = useCallback(async (payload: EncryptedPayload) => {
+    if (!sessionKey) throw new Error("Vault is locked");
+    return await decryptData(payload, sessionKey);
+  }, [sessionKey]);
 
   const lock = useCallback(() => setSessionKey(null), []);
 
   return (
     <VaultContext.Provider value={{
       isUnlocked: !!sessionKey,
-      sessionKey,
       setupVault,
       unlockWithPin,
       unlockWithPasskey,
       resetPin,
       resetPasskey,
+      encryptPayload,
+      decryptPayload,
       lock
     }}>
       {children}
