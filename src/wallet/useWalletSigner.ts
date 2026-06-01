@@ -3,6 +3,10 @@
 // React hook that owns a single signer-worker instance, ties it to your storage
 // adapter, and runs the WebAuthn ceremony (which must happen on the document
 // thread) before handing the PRF bytes to the worker.
+//
+// MNEMONIC CHANGE: `createWallet` now returns the mnemonic once (show it on a
+// backup screen, then drop it), `importWallet` restores from a phrase, and
+// `revealMnemonic` re-exports it for backup while unlocked.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { WalletSignerClient } from './WalletSignerClient';
@@ -51,13 +55,20 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     };
   }, []);
 
-  // Create a brand-new wallet. Optionally also bind a passkey.
-  const createWallet = useCallback(
+  // Shared path for create + import. Returns the mnemonic so the caller can show
+  // a one-time backup screen.
+  const provision = useCallback(
     async (
       userId: string,
       passcode: string,
-      opts?: { withPasskey?: boolean; email?: string }
-    ): Promise<{ address: string } | null> => {
+      opts?: {
+        withPasskey?: boolean;
+        email?: string;
+        importMnemonic?: string;
+        wordCount?: 12 | 24;
+        accountIndex?: number;
+      }
+    ): Promise<{ address: string; mnemonic: string } | null> => {
       try {
         let prfFirstHex: string | undefined;
         let passkeyId: string | undefined;
@@ -67,15 +78,21 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
           prfFirstHex = reg.prfFirstHex;
           passkeyId = reg.passkeyId;
         }
-        const { record, address: addr } = await getClient().generate(passcode, {
-          prfFirstHex,
-          passkeyId,
-          argon2,
-        });
+        const { record, address: addr, mnemonic } = await getClient().generate(
+          passcode,
+          {
+            prfFirstHex,
+            passkeyId,
+            argon2,
+            importMnemonic: opts?.importMnemonic,
+            wordCount: opts?.wordCount,
+            accountIndex: opts?.accountIndex,
+          }
+        );
         await storage.save(userId, record);
         setAddress(addr);
         setIsUnlocked(true);
-        return { address: addr };
+        return { address: addr, mnemonic };
       } catch (err) {
         fail(err);
         return null;
@@ -84,8 +101,30 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     [getClient, storage, argon2, fail]
   );
 
+  // Create a brand-new wallet. Optionally also bind a passkey. The returned
+  // mnemonic must be shown to the user for backup, then dropped from memory.
+  const createWallet = useCallback(
+    (
+      userId: string,
+      passcode: string,
+      opts?: { withPasskey?: boolean; email?: string; wordCount?: 12 | 24 }
+    ) => provision(userId, passcode, opts),
+    [provision]
+  );
+
+  // Restore an existing wallet from a recovery phrase.
+  const importWallet = useCallback(
+    (
+      userId: string,
+      passcode: string,
+      mnemonic: string,
+      opts?: { withPasskey?: boolean; email?: string; accountIndex?: number }
+    ) => provision(userId, passcode, { ...opts, importMnemonic: mnemonic }),
+    [provision]
+  );
+
   const unlockWithPin = useCallback(
-    async (userId: string, passcode: string): Promise<boolean> => {
+    async (userId: string, passcode: string, accountIndex = 0): Promise<boolean> => {
       try {
         const record = await storage.load(userId);
         if (!record) return false;
@@ -95,6 +134,7 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
           pinEnvelope: record.pinEnvelope,
           walletEnvelope: record.walletEnvelope,
           argon2,
+          accountIndex,
         });
         setAddress(addr);
         setIsUnlocked(true);
@@ -108,7 +148,7 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
   );
 
   const unlockWithPasskey = useCallback(
-    async (userId: string): Promise<boolean> => {
+    async (userId: string, accountIndex = 0): Promise<boolean> => {
       try {
         const record = await storage.load(userId);
         if (!record || !record.passkeyEnvelope || !record.passkeyId) return false;
@@ -117,6 +157,7 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
           prfFirstHex,
           passkeyEnvelope: record.passkeyEnvelope,
           walletEnvelope: record.walletEnvelope,
+          accountIndex,
         });
         setAddress(addr);
         setIsUnlocked(true);
@@ -128,6 +169,17 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     },
     [getClient, storage, fail]
   );
+
+  // Reveal the recovery phrase for backup. GATE THIS behind fresh re-auth and an
+  // unforgeable confirmation surface (see README-wallet). Returns null on error.
+  const revealMnemonic = useCallback(async (): Promise<string | null> => {
+    try {
+      return await getClient().exportMnemonic();
+    } catch (err) {
+      fail(err);
+      return null;
+    }
+  }, [getClient, fail]);
 
   // Signs a 32-byte digest (hex). Pair this with a user-confirmation step that a
   // compromised page cannot forge (see README-wallet on transaction approval).
@@ -165,8 +217,10 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     isUnlocked,
     address,
     createWallet,
+    importWallet,
     unlockWithPin,
     unlockWithPasskey,
+    revealMnemonic,
     signDigest,
     personalSign,
     lock,

@@ -1,8 +1,8 @@
 // src/wallet/WalletSignerClient.ts
 //
 // Main-thread handle to the isolated signer worker. Provides a promise-based API
-// and correlates requests/responses by id. The raw private key is never received
-// here — only addresses and signatures cross back.
+// and correlates requests/responses by id. Secret material is never received
+// here except the mnemonic on the explicit generate / exportMnemonic paths.
 
 import {
   SignerRequest,
@@ -18,6 +18,18 @@ type Pending = {
   resolve: (value: SignerResponse) => void;
   reject: (reason: Error) => void;
 };
+
+export interface GenerateClientOptions {
+  prfFirstHex?: string;
+  passkeyId?: string;
+  argon2?: Argon2Params;
+  /** Provide to RESTORE an existing wallet; omit to create a fresh one. */
+  importMnemonic?: string;
+  /** Only used when creating fresh (default 12). */
+  wordCount?: 12 | 24;
+  /** BIP44 account index for the active account (default 0). */
+  accountIndex?: number;
+}
 
 export class WalletSignerClient {
   private worker: Worker;
@@ -53,20 +65,28 @@ export class WalletSignerClient {
     });
   }
 
+  /**
+   * Create a fresh wallet, or restore one by passing `importMnemonic`.
+   * Returns the mnemonic ONCE so the UI can present a backup screen — it is not
+   * persisted in cleartext and must be shown to the user immediately, then dropped.
+   */
   async generate(
     passcode: string,
-    opts?: { prfFirstHex?: string; passkeyId?: string; argon2?: Argon2Params }
-  ): Promise<{ record: WalletVaultRecord; address: string }> {
+    opts?: GenerateClientOptions
+  ): Promise<{ record: WalletVaultRecord; address: string; mnemonic: string }> {
     const res = await this.call({
       type: 'generate',
       passcode,
       prfFirstHex: opts?.prfFirstHex,
       passkeyId: opts?.passkeyId,
       argon2: opts?.argon2,
+      importMnemonic: opts?.importMnemonic,
+      wordCount: opts?.wordCount,
+      accountIndex: opts?.accountIndex,
     });
     if (!res.ok) throw new Error(res.error);
     if (res.type !== 'generate') throw new Error('Unexpected response');
-    return { record: res.record, address: res.address };
+    return { record: res.record, address: res.address, mnemonic: res.mnemonic };
   }
 
   async unlockWithPin(args: {
@@ -75,6 +95,7 @@ export class WalletSignerClient {
     pinEnvelope: string;
     walletEnvelope: string;
     argon2?: Argon2Params;
+    accountIndex?: number;
   }): Promise<string> {
     const res = await this.call({ type: 'unlockPin', ...args });
     if (!res.ok) throw new Error(res.error);
@@ -86,6 +107,7 @@ export class WalletSignerClient {
     prfFirstHex: string;
     passkeyEnvelope: string;
     walletEnvelope: string;
+    accountIndex?: number;
   }): Promise<string> {
     const res = await this.call({ type: 'unlockPasskey', ...args });
     if (!res.ok) throw new Error(res.error);
@@ -114,11 +136,23 @@ export class WalletSignerClient {
     return res.address;
   }
 
+  /**
+   * Reveal the recovery phrase for backup. Requires an unlocked signer.
+   * GATE THIS in your app behind fresh re-authentication and an
+   * unforgeable confirmation surface — see README-wallet.
+   */
+  async exportMnemonic(): Promise<string> {
+    const res = await this.call({ type: 'exportMnemonic' });
+    if (!res.ok) throw new Error(res.error);
+    if (res.type !== 'exportMnemonic') throw new Error('Unexpected response');
+    return res.mnemonic;
+  }
+
   async lock(): Promise<void> {
     await this.call({ type: 'lock' });
   }
 
-  /** Wipes keys and tears down the worker. Call on logout/unmount. */
+  /** Wipes secrets and tears down the worker. Call on logout/unmount. */
   destroy(): void {
     this.worker.terminate();
     for (const [, p] of this.pending) p.reject(new Error('Signer destroyed'));

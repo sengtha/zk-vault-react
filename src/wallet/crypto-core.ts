@@ -2,16 +2,31 @@
 //
 // Environment-agnostic crypto used INSIDE the signer worker. Uses only the
 // global `crypto.subtle` (available in both window and worker scopes), noble
-// curves/hashes, and hash-wasm — no DOM-specific APIs — so it compiles and runs
-// in a Web Worker.
+// curves/hashes, hash-wasm, and the scure BIP39/BIP32 stack — no DOM-specific
+// APIs — so it compiles and runs in a Web Worker.
 //
 // This module never returns raw private-key bytes to anything outside the
-// worker. Callers get addresses and signatures only.
+// worker. Callers get addresses, signatures, and (only on the deliberate backup
+// path) the mnemonic.
+//
+// MNEMONIC CHANGE (vs. the original raw-key version):
+//   The stored secret is now a BIP39 mnemonic, not a random secp256k1 key. The
+//   `walletEnvelope` holds the DEK-encrypted *mnemonic*; account private keys
+//   are derived from it on demand via BIP44 (m/44'/60'/0'/0/index) and never
+//   persisted. This gives human-readable backup + HD multi-account, while the
+//   dual-envelope / Argon2id / worker-isolation design is unchanged.
 
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { argon2id } from 'hash-wasm';
+import { HDKey } from '@scure/bip32';
+import {
+  generateMnemonic,
+  mnemonicToSeedSync,
+  validateMnemonic,
+} from '@scure/bip39';
+import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { Envelope, Argon2Params, EthSignature } from './messages';
 
 const AES = 'AES-GCM';
@@ -22,7 +37,12 @@ export const DEFAULT_ARGON2: Argon2Params = {
   parallelism: 1,
 };
 
+// BIP44 path for Ethereum / EVM chains (Base included): m/44'/60'/0'/0/<index>
+export const ethDerivationPath = (accountIndex: number): string =>
+  `m/44'/60'/0'/0/${accountIndex}`;
+
 const enc = new TextEncoder();
+const dec = new TextDecoder();
 
 function randomBytes(n: number): Uint8Array<ArrayBuffer> {
   const b = new Uint8Array(new ArrayBuffer(n));
@@ -49,6 +69,50 @@ export function hex(u8: Uint8Array): string {
 }
 export function unhex(s: string): Uint8Array {
   return hexToBytes(s.startsWith('0x') ? s.slice(2) : s);
+}
+
+// ---- BIP39 mnemonic helpers ----
+
+/** Generate a fresh BIP39 mnemonic. 12 words = 128 bits, 24 words = 256 bits. */
+export function newMnemonic(wordCount: 12 | 24 = 12): string {
+  return generateMnemonic(wordlist, wordCount === 24 ? 256 : 128);
+}
+
+/** Normalize (trim + collapse whitespace, lowercase) for consistent handling. */
+export function normalizeMnemonic(mnemonic: string): string {
+  return mnemonic.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/** Throws if the phrase is not a valid English BIP39 mnemonic (bad checksum/word). */
+export function assertValidMnemonic(mnemonic: string): void {
+  if (!validateMnemonic(normalizeMnemonic(mnemonic), wordlist)) {
+    throw new Error('Invalid recovery phrase (BIP39 checksum/word check failed).');
+  }
+}
+
+export function isValidMnemonic(mnemonic: string): boolean {
+  return validateMnemonic(normalizeMnemonic(mnemonic), wordlist);
+}
+
+/**
+ * Derive the secp256k1 private key for a given account index from a mnemonic.
+ * Intermediate seed + HD node private material is wiped on the way out; the
+ * returned 32-byte key is a copy the caller (the worker) keeps in its memory.
+ */
+export function privateKeyFromMnemonic(
+  mnemonic: string,
+  accountIndex = 0
+): Uint8Array {
+  const seed = mnemonicToSeedSync(normalizeMnemonic(mnemonic), ''); // no BIP39 passphrase
+  const hd = HDKey.fromMasterSeed(seed);
+  const child = hd.derive(ethDerivationPath(accountIndex));
+  if (!child.privateKey) throw new Error('HD derivation produced no private key.');
+  const priv = new Uint8Array(child.privateKey); // copy out before wiping
+  // Best-effort wipe of intermediates.
+  seed.fill(0);
+  child.wipePrivateData?.();
+  hd.wipePrivateData?.();
+  return priv;
 }
 
 // ---- Argon2id KEK derivation ----
@@ -111,7 +175,7 @@ async function unwrapDek(env: Envelope, kek: CryptoKey): Promise<CryptoKey> {
   );
 }
 
-// ---- Wallet key <-> envelope (encrypted by the DEK) ----
+// ---- Secret (mnemonic) <-> envelope (encrypted by the DEK) ----
 async function encryptWithDek(dek: CryptoKey, data: Uint8Array): Promise<Envelope> {
   const iv = randomBytes(12);
   const cipher = await crypto.subtle.encrypt({ name: AES, iv }, dek, toBuf(data));
@@ -180,17 +244,30 @@ export interface GenerateResult {
   pinSalt: string;
   pinEnvelope: Envelope;
   passkeyEnvelope: Envelope | null;
-  walletEnvelope: Envelope;
+  walletEnvelope: Envelope; // DEK-encrypted MNEMONIC (utf-8 bytes)
   address: string;
-  // The raw key is intentionally NOT part of this result.
+  accountIndex: number;
+  // Worker-retained; intentionally NOT persisted.
   dek: CryptoKey;
   privateKey: Uint8Array;
+  // Returned ONCE so the UI can show a backup screen. Never stored in cleartext.
+  mnemonic: string;
+}
+
+export interface GenerateOptions {
+  prfFirst?: Uint8Array;
+  /** Provide to RESTORE an existing wallet; omit to create a fresh one. */
+  importMnemonic?: string;
+  /** Only used when creating fresh (ignored on import). */
+  wordCount?: 12 | 24;
+  /** BIP44 account index for the active account (default 0). */
+  accountIndex?: number;
 }
 
 export async function generateWallet(
   passcode: string,
   argon2: Argon2Params,
-  prfFirst?: Uint8Array
+  opts: GenerateOptions = {}
 ): Promise<GenerateResult> {
   const dek = await generateDek();
 
@@ -199,13 +276,19 @@ export async function generateWallet(
   const pinEnvelope = await wrapDek(dek, pinKek);
 
   let passkeyEnvelope: Envelope | null = null;
-  if (prfFirst) {
-    const passkeyKek = await kekFromPrf(prfFirst);
+  if (opts.prfFirst) {
+    const passkeyKek = await kekFromPrf(opts.prfFirst);
     passkeyEnvelope = await wrapDek(dek, passkeyKek);
   }
 
-  const privateKey = secp256k1.utils.randomSecretKey();
-  const walletEnvelope = await encryptWithDek(dek, privateKey);
+  const mnemonic = opts.importMnemonic
+    ? normalizeMnemonic(opts.importMnemonic)
+    : newMnemonic(opts.wordCount ?? 12);
+  assertValidMnemonic(mnemonic);
+
+  const accountIndex = opts.accountIndex ?? 0;
+  const walletEnvelope = await encryptWithDek(dek, enc.encode(mnemonic));
+  const privateKey = privateKeyFromMnemonic(mnemonic, accountIndex);
   const address = addressFromPrivateKey(privateKey);
 
   return {
@@ -214,9 +297,19 @@ export async function generateWallet(
     passkeyEnvelope,
     walletEnvelope,
     address,
+    accountIndex,
     dek,
     privateKey,
+    mnemonic,
   };
+}
+
+export interface UnlockResult {
+  dek: CryptoKey;
+  privateKey: Uint8Array;
+  mnemonic: string;
+  address: string;
+  accountIndex: number;
 }
 
 export async function unlockWithPin(
@@ -224,21 +317,43 @@ export async function unlockWithPin(
   pinSalt: string,
   pinEnvelope: Envelope,
   walletEnvelope: Envelope,
-  argon2: Argon2Params
-): Promise<{ dek: CryptoKey; privateKey: Uint8Array; address: string }> {
+  argon2: Argon2Params,
+  accountIndex = 0
+): Promise<UnlockResult> {
   const kek = await deriveKekArgon2(passcode, unhex(pinSalt), argon2);
   const dek = await unwrapDek(pinEnvelope, kek);
-  const privateKey = await decryptWithDek(dek, walletEnvelope);
-  return { dek, privateKey, address: addressFromPrivateKey(privateKey) };
+  const mnemonicBytes = await decryptWithDek(dek, walletEnvelope);
+  const mnemonic = dec.decode(mnemonicBytes);
+  mnemonicBytes.fill(0);
+  assertValidMnemonic(mnemonic);
+  const privateKey = privateKeyFromMnemonic(mnemonic, accountIndex);
+  return {
+    dek,
+    privateKey,
+    mnemonic,
+    address: addressFromPrivateKey(privateKey),
+    accountIndex,
+  };
 }
 
 export async function unlockWithPasskey(
   prfFirst: Uint8Array,
   passkeyEnvelope: Envelope,
-  walletEnvelope: Envelope
-): Promise<{ dek: CryptoKey; privateKey: Uint8Array; address: string }> {
+  walletEnvelope: Envelope,
+  accountIndex = 0
+): Promise<UnlockResult> {
   const kek = await kekFromPrf(prfFirst);
   const dek = await unwrapDek(passkeyEnvelope, kek);
-  const privateKey = await decryptWithDek(dek, walletEnvelope);
-  return { dek, privateKey, address: addressFromPrivateKey(privateKey) };
+  const mnemonicBytes = await decryptWithDek(dek, walletEnvelope);
+  const mnemonic = dec.decode(mnemonicBytes);
+  mnemonicBytes.fill(0);
+  assertValidMnemonic(mnemonic);
+  const privateKey = privateKeyFromMnemonic(mnemonic, accountIndex);
+  return {
+    dek,
+    privateKey,
+    mnemonic,
+    address: addressFromPrivateKey(privateKey),
+    accountIndex,
+  };
 }
