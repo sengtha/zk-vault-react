@@ -1,16 +1,12 @@
 // src/wallet/signer.worker.ts
 //
-// Isolated signer. The mnemonic and derived private key live ONLY in this
-// worker's memory. The main thread can ask it to unlock, sign, report its
-// address, and — on the explicit backup path — export the mnemonic. There is no
-// other message that returns secret material. A compromised main thread cannot
-// read secrets out of here passively; it can only request signatures while
-// unlocked, or call exportMnemonic (which is why per-action confirmation still
-// matters — see README-wallet).
-//
-// MNEMONIC CHANGE: the retained secret is the BIP39 mnemonic; the active
-// account's private key is derived from it (BIP44) and kept alongside for
-// signing. `generate` returns the mnemonic once for the backup screen.
+// Isolated signer. The secret (mnemonic OR raw private key) and the active
+// derived/loaded private key live ONLY in this worker's memory. The main thread
+// can ask it to unlock, sign, report its address, and — on the explicit backup
+// path — export the secret. A compromised main thread cannot read secrets out of
+// here passively; it can only request signatures while unlocked, or call
+// exportSecret (which is why per-action confirmation still matters — see
+// README-wallet).
 
 /// <reference lib="webworker" />
 
@@ -23,13 +19,15 @@ import {
   unhex,
   DEFAULT_ARGON2,
 } from './crypto-core';
-import { SignerRequest, SignerResponse } from './messages';
+import { SignerRequest, SignerResponse, WalletSecretKind } from './messages';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 
-// Secret material — confined to this worker, never posted out except mnemonic
-// on the explicit generate/exportMnemonic paths.
+// Secret material — confined to this worker. Exactly one of mnemonic /
+// privateKeyHex is set, matching secretKind.
+let secretKind: WalletSecretKind | null = null;
 let mnemonic: string | null = null;
+let privateKeyHex: string | null = null;
 let privateKey: Uint8Array | null = null;
 let dek: CryptoKey | null = null;
 let address: string | null = null;
@@ -41,10 +39,12 @@ function zeroize() {
   dek = null;
   address = null;
   accountIndex = 0;
+  secretKind = null;
   // JS strings are immutable, so we cannot scrub the bytes; dropping the only
-  // reference makes it eligible for GC. For stronger guarantees, keep the
-  // unlocked session short and lock aggressively.
+  // reference makes it eligible for GC. Keep unlocked sessions short and lock
+  // aggressively for stronger guarantees.
   mnemonic = null;
+  privateKeyHex = null;
 }
 
 function reply(msg: SignerResponse) {
@@ -60,12 +60,15 @@ ctx.addEventListener('message', async (ev: MessageEvent<SignerRequest>) => {
         const res = await generateWallet(req.passcode, req.argon2 ?? DEFAULT_ARGON2, {
           prfFirst: prf,
           importMnemonic: req.importMnemonic,
+          importPrivateKeyHex: req.importPrivateKeyHex,
           wordCount: req.wordCount,
           accountIndex: req.accountIndex,
         });
         // Retain secret material in the worker; expose envelopes + address, plus
-        // the mnemonic ONCE so the app can present a backup screen.
+        // the secret ONCE so the app can present a backup screen.
+        secretKind = res.secretKind;
         mnemonic = res.mnemonic;
+        privateKeyHex = res.privateKeyHex;
         privateKey = res.privateKey;
         dek = res.dek;
         address = res.address;
@@ -75,7 +78,9 @@ ctx.addEventListener('message', async (ev: MessageEvent<SignerRequest>) => {
           ok: true,
           type: 'generate',
           address: res.address,
+          secretKind: res.secretKind,
           mnemonic: res.mnemonic,
+          privateKeyHex: res.privateKeyHex,
           record: {
             pinSalt: res.pinSalt,
             pinEnvelope: JSON.stringify(res.pinEnvelope),
@@ -98,12 +103,14 @@ ctx.addEventListener('message', async (ev: MessageEvent<SignerRequest>) => {
           req.argon2 ?? DEFAULT_ARGON2,
           req.accountIndex ?? 0
         );
+        secretKind = out.secretKind;
         mnemonic = out.mnemonic;
+        privateKeyHex = out.privateKeyHex;
         privateKey = out.privateKey;
         dek = out.dek;
         address = out.address;
         accountIndex = out.accountIndex;
-        reply({ id: req.id, ok: true, type: 'unlockPin', address: out.address });
+        reply({ id: req.id, ok: true, type: 'unlockPin', address: out.address, secretKind: out.secretKind });
         break;
       }
 
@@ -114,12 +121,14 @@ ctx.addEventListener('message', async (ev: MessageEvent<SignerRequest>) => {
           JSON.parse(req.walletEnvelope),
           req.accountIndex ?? 0
         );
+        secretKind = out.secretKind;
         mnemonic = out.mnemonic;
+        privateKeyHex = out.privateKeyHex;
         privateKey = out.privateKey;
         dek = out.dek;
         address = out.address;
         accountIndex = out.accountIndex;
-        reply({ id: req.id, ok: true, type: 'unlockPasskey', address: out.address });
+        reply({ id: req.id, ok: true, type: 'unlockPasskey', address: out.address, secretKind: out.secretKind });
         break;
       }
 
@@ -143,13 +152,20 @@ ctx.addEventListener('message', async (ev: MessageEvent<SignerRequest>) => {
         break;
       }
 
-      case 'exportMnemonic': {
-        // DELIBERATE isolation breach for backup / "reveal recovery phrase".
+      case 'exportSecret': {
+        // DELIBERATE isolation breach for backup / "reveal recovery phrase or key".
         // Only available while unlocked. The caller MUST gate this behind fresh
         // re-authentication and a confirmation surface a compromised page cannot
         // forge (cross-origin iframe). See README-wallet.
-        if (!mnemonic) throw new Error('Signer is locked.');
-        reply({ id: req.id, ok: true, type: 'exportMnemonic', mnemonic });
+        if (!secretKind) throw new Error('Signer is locked.');
+        reply({
+          id: req.id,
+          ok: true,
+          type: 'exportSecret',
+          secretKind,
+          mnemonic,
+          privateKeyHex,
+        });
         break;
       }
 

@@ -4,13 +4,13 @@
 // adapter, and runs the WebAuthn ceremony (which must happen on the document
 // thread) before handing the PRF bytes to the worker.
 //
-// MNEMONIC CHANGE: `createWallet` now returns the mnemonic once (show it on a
-// backup screen, then drop it), `importWallet` restores from a phrase, and
-// `revealMnemonic` re-exports it for backup while unlocked.
+// DUAL SECRET SUPPORT: `createWallet` makes a fresh mnemonic wallet,
+// `importWallet` restores from a phrase, `importPrivateKey` imports a raw key,
+// and `revealSecret` re-exports whichever secret the wallet holds (for backup).
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { WalletSignerClient } from './WalletSignerClient';
-import { WalletVaultRecord, EthSignature, Argon2Params } from './messages';
+import { WalletSignerClient, SecretBackup } from './WalletSignerClient';
+import { WalletVaultRecord, EthSignature, Argon2Params, WalletSecretKind } from './messages';
 import {
   registerPasskeyPrf,
   authenticatePasskeyPrf,
@@ -29,10 +29,13 @@ export interface UseWalletSignerOptions {
   onError?: (err: Error) => void;
 }
 
+export type ProvisionResult = { address: string } & SecretBackup;
+
 export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOptions) {
   const clientRef = useRef<WalletSignerClient | null>(null);
   const [address, setAddress] = useState<string | null>(null);
   const [isUnlocked, setIsUnlocked] = useState(false);
+  const [secretKind, setSecretKind] = useState<WalletSecretKind | null>(null);
 
   const getClient = useCallback(() => {
     if (!clientRef.current) clientRef.current = new WalletSignerClient();
@@ -55,8 +58,8 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     };
   }, []);
 
-  // Shared path for create + import. Returns the mnemonic so the caller can show
-  // a one-time backup screen.
+  // Shared path for create + import. Returns the secret so the caller can show a
+  // one-time backup screen (mnemonic OR private key, per secretKind).
   const provision = useCallback(
     async (
       userId: string,
@@ -65,10 +68,11 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
         withPasskey?: boolean;
         email?: string;
         importMnemonic?: string;
+        importPrivateKeyHex?: string;
         wordCount?: 12 | 24;
         accountIndex?: number;
       }
-    ): Promise<{ address: string; mnemonic: string } | null> => {
+    ): Promise<ProvisionResult | null> => {
       try {
         let prfFirstHex: string | undefined;
         let passkeyId: string | undefined;
@@ -78,21 +82,25 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
           prfFirstHex = reg.prfFirstHex;
           passkeyId = reg.passkeyId;
         }
-        const { record, address: addr, mnemonic } = await getClient().generate(
-          passcode,
-          {
-            prfFirstHex,
-            passkeyId,
-            argon2,
-            importMnemonic: opts?.importMnemonic,
-            wordCount: opts?.wordCount,
-            accountIndex: opts?.accountIndex,
-          }
-        );
-        await storage.save(userId, record);
-        setAddress(addr);
+        const res = await getClient().generate(passcode, {
+          prfFirstHex,
+          passkeyId,
+          argon2,
+          importMnemonic: opts?.importMnemonic,
+          importPrivateKeyHex: opts?.importPrivateKeyHex,
+          wordCount: opts?.wordCount,
+          accountIndex: opts?.accountIndex,
+        });
+        await storage.save(userId, res.record);
+        setAddress(res.address);
+        setSecretKind(res.secretKind);
         setIsUnlocked(true);
-        return { address: addr, mnemonic };
+        return {
+          address: res.address,
+          secretKind: res.secretKind,
+          mnemonic: res.mnemonic,
+          privateKeyHex: res.privateKeyHex,
+        };
       } catch (err) {
         fail(err);
         return null;
@@ -101,8 +109,8 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     [getClient, storage, argon2, fail]
   );
 
-  // Create a brand-new wallet. Optionally also bind a passkey. The returned
-  // mnemonic must be shown to the user for backup, then dropped from memory.
+  // Create a brand-new mnemonic (HD) wallet. The returned mnemonic must be shown
+  // for backup, then dropped from memory.
   const createWallet = useCallback(
     (
       userId: string,
@@ -112,7 +120,7 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     [provision]
   );
 
-  // Restore an existing wallet from a recovery phrase.
+  // Restore an HD wallet from a recovery phrase.
   const importWallet = useCallback(
     (
       userId: string,
@@ -123,12 +131,23 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     [provision]
   );
 
+  // Import a single raw private key (single-account wallet, no recovery phrase).
+  const importPrivateKey = useCallback(
+    (
+      userId: string,
+      passcode: string,
+      privateKeyHex: string,
+      opts?: { withPasskey?: boolean; email?: string }
+    ) => provision(userId, passcode, { ...opts, importPrivateKeyHex: privateKeyHex }),
+    [provision]
+  );
+
   const unlockWithPin = useCallback(
     async (userId: string, passcode: string, accountIndex = 0): Promise<boolean> => {
       try {
         const record = await storage.load(userId);
         if (!record) return false;
-        const addr = await getClient().unlockWithPin({
+        const { address: addr, secretKind: kind } = await getClient().unlockWithPin({
           passcode,
           pinSalt: record.pinSalt,
           pinEnvelope: record.pinEnvelope,
@@ -137,6 +156,7 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
           accountIndex,
         });
         setAddress(addr);
+        setSecretKind(kind);
         setIsUnlocked(true);
         return true;
       } catch (err) {
@@ -153,13 +173,14 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
         const record = await storage.load(userId);
         if (!record || !record.passkeyEnvelope || !record.passkeyId) return false;
         const prfFirstHex = await authenticatePasskeyPrf(record.passkeyId);
-        const addr = await getClient().unlockWithPasskey({
+        const { address: addr, secretKind: kind } = await getClient().unlockWithPasskey({
           prfFirstHex,
           passkeyEnvelope: record.passkeyEnvelope,
           walletEnvelope: record.walletEnvelope,
           accountIndex,
         });
         setAddress(addr);
+        setSecretKind(kind);
         setIsUnlocked(true);
         return true;
       } catch (err) {
@@ -170,8 +191,18 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     [getClient, storage, fail]
   );
 
-  // Reveal the recovery phrase for backup. GATE THIS behind fresh re-auth and an
-  // unforgeable confirmation surface (see README-wallet). Returns null on error.
+  // Reveal the secret (phrase or key) for backup. GATE THIS behind fresh re-auth
+  // and an unforgeable confirmation surface (see README-wallet).
+  const revealSecret = useCallback(async (): Promise<SecretBackup | null> => {
+    try {
+      return await getClient().exportSecret();
+    } catch (err) {
+      fail(err);
+      return null;
+    }
+  }, [getClient, fail]);
+
+  // Convenience: mnemonic-only reveal (returns null on error or for raw-key wallets).
   const revealMnemonic = useCallback(async (): Promise<string | null> => {
     try {
       return await getClient().exportMnemonic();
@@ -211,15 +242,19 @@ export function useWalletSigner({ storage, argon2, onError }: UseWalletSignerOpt
     await clientRef.current?.lock();
     setIsUnlocked(false);
     setAddress(null);
+    setSecretKind(null);
   }, []);
 
   return {
     isUnlocked,
     address,
+    secretKind,
     createWallet,
     importWallet,
+    importPrivateKey,
     unlockWithPin,
     unlockWithPasskey,
+    revealSecret,
     revealMnemonic,
     signDigest,
     personalSign,

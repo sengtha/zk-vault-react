@@ -2,7 +2,7 @@
 //
 // Main-thread handle to the isolated signer worker. Provides a promise-based API
 // and correlates requests/responses by id. Secret material is never received
-// here except the mnemonic on the explicit generate / exportMnemonic paths.
+// here except on the explicit generate / exportSecret backup paths.
 
 import {
   SignerRequest,
@@ -10,6 +10,7 @@ import {
   WalletVaultRecord,
   EthSignature,
   Argon2Params,
+  WalletSecretKind,
 } from './messages';
 
 type WithoutId<T> = T extends { id: number } ? Omit<T, 'id'> : never;
@@ -23,12 +24,20 @@ export interface GenerateClientOptions {
   prfFirstHex?: string;
   passkeyId?: string;
   argon2?: Argon2Params;
-  /** Provide to RESTORE an existing wallet; omit to create a fresh one. */
+  /** Restore from an existing recovery phrase. */
   importMnemonic?: string;
-  /** Only used when creating fresh (default 12). */
+  /** Restore from an existing raw private key (hex). */
+  importPrivateKeyHex?: string;
+  /** Fresh mnemonic only (default 12). */
   wordCount?: 12 | 24;
-  /** BIP44 account index for the active account (default 0). */
+  /** BIP44 account index for mnemonic wallets (default 0; ignored for raw keys). */
   accountIndex?: number;
+}
+
+export interface SecretBackup {
+  secretKind: WalletSecretKind;
+  mnemonic: string | null;
+  privateKeyHex: string | null;
 }
 
 export class WalletSignerClient {
@@ -66,14 +75,15 @@ export class WalletSignerClient {
   }
 
   /**
-   * Create a fresh wallet, or restore one by passing `importMnemonic`.
-   * Returns the mnemonic ONCE so the UI can present a backup screen — it is not
-   * persisted in cleartext and must be shown to the user immediately, then dropped.
+   * Create a fresh mnemonic wallet, or restore one via `importMnemonic` /
+   * `importPrivateKeyHex`. Returns the secret ONCE so the UI can present a
+   * backup screen — exactly one of mnemonic / privateKeyHex is non-null. The
+   * secret is not persisted in cleartext; show it immediately, then drop it.
    */
   async generate(
     passcode: string,
     opts?: GenerateClientOptions
-  ): Promise<{ record: WalletVaultRecord; address: string; mnemonic: string }> {
+  ): Promise<{ record: WalletVaultRecord; address: string } & SecretBackup> {
     const res = await this.call({
       type: 'generate',
       passcode,
@@ -81,12 +91,19 @@ export class WalletSignerClient {
       passkeyId: opts?.passkeyId,
       argon2: opts?.argon2,
       importMnemonic: opts?.importMnemonic,
+      importPrivateKeyHex: opts?.importPrivateKeyHex,
       wordCount: opts?.wordCount,
       accountIndex: opts?.accountIndex,
     });
     if (!res.ok) throw new Error(res.error);
     if (res.type !== 'generate') throw new Error('Unexpected response');
-    return { record: res.record, address: res.address, mnemonic: res.mnemonic };
+    return {
+      record: res.record,
+      address: res.address,
+      secretKind: res.secretKind,
+      mnemonic: res.mnemonic,
+      privateKeyHex: res.privateKeyHex,
+    };
   }
 
   async unlockWithPin(args: {
@@ -96,11 +113,11 @@ export class WalletSignerClient {
     walletEnvelope: string;
     argon2?: Argon2Params;
     accountIndex?: number;
-  }): Promise<string> {
+  }): Promise<{ address: string; secretKind: WalletSecretKind }> {
     const res = await this.call({ type: 'unlockPin', ...args });
     if (!res.ok) throw new Error(res.error);
     if (res.type !== 'unlockPin') throw new Error('Unexpected response');
-    return res.address;
+    return { address: res.address, secretKind: res.secretKind };
   }
 
   async unlockWithPasskey(args: {
@@ -108,11 +125,11 @@ export class WalletSignerClient {
     passkeyEnvelope: string;
     walletEnvelope: string;
     accountIndex?: number;
-  }): Promise<string> {
+  }): Promise<{ address: string; secretKind: WalletSecretKind }> {
     const res = await this.call({ type: 'unlockPasskey', ...args });
     if (!res.ok) throw new Error(res.error);
     if (res.type !== 'unlockPasskey') throw new Error('Unexpected response');
-    return res.address;
+    return { address: res.address, secretKind: res.secretKind };
   }
 
   async signDigest(digestHex: string): Promise<EthSignature> {
@@ -137,15 +154,28 @@ export class WalletSignerClient {
   }
 
   /**
-   * Reveal the recovery phrase for backup. Requires an unlocked signer.
-   * GATE THIS in your app behind fresh re-authentication and an
+   * Reveal the secret (recovery phrase or private key) for backup. Requires an
+   * unlocked signer. GATE THIS in your app behind fresh re-authentication and an
    * unforgeable confirmation surface — see README-wallet.
    */
-  async exportMnemonic(): Promise<string> {
-    const res = await this.call({ type: 'exportMnemonic' });
+  async exportSecret(): Promise<SecretBackup> {
+    const res = await this.call({ type: 'exportSecret' });
     if (!res.ok) throw new Error(res.error);
-    if (res.type !== 'exportMnemonic') throw new Error('Unexpected response');
-    return res.mnemonic;
+    if (res.type !== 'exportSecret') throw new Error('Unexpected response');
+    return {
+      secretKind: res.secretKind,
+      mnemonic: res.mnemonic,
+      privateKeyHex: res.privateKeyHex,
+    };
+  }
+
+  /** Convenience: returns the mnemonic, or throws if this is a raw-key wallet. */
+  async exportMnemonic(): Promise<string> {
+    const s = await this.exportSecret();
+    if (s.secretKind !== 'mnemonic' || !s.mnemonic) {
+      throw new Error('This wallet was imported from a private key; it has no recovery phrase.');
+    }
+    return s.mnemonic;
   }
 
   async lock(): Promise<void> {
